@@ -1,0 +1,582 @@
+-- ============================================================================
+-- 游艇码头 Marina 运营管理 · 建表 + 种子数据
+-- 库名 marina_berth，由 mysql 镜像的 docker-entrypoint 在【镜像构建期】执行一次。
+-- 后端 spring.jpa.hibernate.ddl-auto=none，表结构与演示数据全靠这份脚本。
+--
+-- 五个业务模块：
+--   1. berth           泊位（区域 A/B/C + 栈桥、泊位长度、最大吃水、允许船型、日租金）
+--   2. vessel          船只（船名/船籍号/船主/船型/主尺度/登记日期/保险到期日）
+--   3. berthing        靠泊记录（靠泊 → 离泊结算，天数 × 日租金 = 停泊费）
+--   4. sailing_plan    出航申报（待审批 → 已批准 → 已返航 / 已取消）
+--   5. service_record  码头服务与费用（接电/加水/加油/清洗/吊机/维修/污油水）
+--
+-- 数据访问主路线：berth 上没有「当前船只」字段、vessel 上没有「当前泊位」字段，
+-- 这两个派生关联由实体上的 Hibernate @JoinFormula 从 berthing 表的「在泊」行现算，
+-- 所以下面 berthing 里的 IN_PORT 行必须与 berth.status = 'IN_PORT' 一一对应。
+--
+-- 种子数据对照：
+--   [M1] 泊位状态齐活      → IN_PORT 9 / RESERVED 2 / DISABLED 2 / FREE 11（共 24 个）
+--   [M1] @JoinFormula      → 9 条在泊记录让 A-01/A-02/A-05/B-01/B-03/B-04/B-08/C-02/C-05 带出船名
+--   [M2] 保险预警          → 双子星已逾期 5 天、碧海钓翁剩 12 天、海之韵剩 25 天
+--   [M3] 停泊费 = 天数×日租金 → SETTLED 的 13 条都已按泊位日租金算好
+--   [M4] 超期未返          → SP-2026-0006 超 6 小时、SP-2026-0007 超 28 小时
+--   [M5] 月度费用汇总      → 服务记录横跨近 45 天，可落进两个自然月做月度对比
+-- ============================================================================
+
+-- 脚本里的中文是 UTF-8：先声明客户端字符集，否则 mysql 客户端按 latin1 读文件会存成乱码
+SET NAMES utf8mb4;
+
+CREATE DATABASE IF NOT EXISTS marina_berth DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+USE marina_berth;
+
+-- ---------------------------- 模块一：泊位 ----------------------------
+CREATE TABLE berth (
+  id           BIGINT       NOT NULL AUTO_INCREMENT,
+  berth_no     VARCHAR(16)  NOT NULL COMMENT '泊位号，如 A-01',
+  zone_code    VARCHAR(4)   NOT NULL COMMENT '所属区域 A/B/C',
+  pier_no      VARCHAR(16)  NOT NULL COMMENT '栈桥编号，如 A1',
+  length_m     DECIMAL(6,2) NOT NULL COMMENT '泊位长度（m）',
+  max_draft_m  DECIMAL(5,2) NOT NULL COMMENT '最大吃水（m）',
+  allow_type   VARCHAR(64)  NOT NULL COMMENT '允许船型，分号分隔 SAIL;POWER;FISHING;CATAMARAN;SPEED',
+  daily_rate   DECIMAL(10,2) NOT NULL COMMENT '日租金（元/天）',
+  utility      VARCHAR(16)  NOT NULL COMMENT '水电接口 POWER_WATER/POWER/WATER/NONE',
+  status       VARCHAR(16)  NOT NULL COMMENT 'FREE 空闲 / IN_PORT 在泊 / RESERVED 预留 / DISABLED 停用维修',
+  updated_at   DATETIME     NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_berth_no (berth_no),
+  KEY idx_berth_zone (zone_code),
+  KEY idx_berth_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='泊位';
+
+-- ---------------------------- 模块二：船只 ----------------------------
+CREATE TABLE vessel (
+  id            BIGINT       NOT NULL AUTO_INCREMENT,
+  name          VARCHAR(32)  NOT NULL COMMENT '船名',
+  reg_no        VARCHAR(24)  NOT NULL COMMENT '船籍注册号',
+  owner_name    VARCHAR(32)  NOT NULL COMMENT '船主',
+  type_code     VARCHAR(16)  NOT NULL COMMENT 'SAIL 帆船/POWER 动力艇/FISHING 钓鱼艇/CATAMARAN 双体船/SPEED 快艇',
+  length_m      DECIMAL(6,2) NOT NULL COMMENT '船长（m）',
+  width_m       DECIMAL(5,2) NOT NULL COMMENT '船宽（m）',
+  draft_m       DECIMAL(5,2) NOT NULL COMMENT '吃水（m）',
+  reg_date      DATE         NOT NULL COMMENT '登记日期',
+  insurance_due DATE         NOT NULL COMMENT '保险到期日',
+  status        VARCHAR(16)  NOT NULL COMMENT 'IN_PORT 在港/OUT_SEA 出海/MAINTENANCE 维修/TERMINATED 退租',
+  updated_at    DATETIME     NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_vessel_reg_no (reg_no),
+  UNIQUE KEY uk_vessel_name (name),
+  KEY idx_vessel_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='船只台账';
+
+-- ---------------------------- 模块三：靠泊记录 ----------------------------
+CREATE TABLE berthing (
+  id            BIGINT       NOT NULL AUTO_INCREMENT,
+  record_no     VARCHAR(24)  NOT NULL COMMENT '记录单号',
+  berth_id      BIGINT       NOT NULL,
+  vessel_id     BIGINT       NOT NULL,
+  berth_time    DATETIME     NOT NULL COMMENT '靠泊时间',
+  eta_depart    DATETIME     NULL     COMMENT '预计离泊时间',
+  actual_depart DATETIME     NULL     COMMENT '实际离泊时间',
+  days          INT          NULL     COMMENT '停泊天数（不足一天按一天）',
+  fee           DECIMAL(12,2) NULL    COMMENT '停泊费用 = 天数 × 日租金',
+  status        VARCHAR(16)  NOT NULL COMMENT 'IN_PORT 在泊 / SETTLED 已结算离泊',
+  updated_at    DATETIME     NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_berthing_no (record_no),
+  KEY idx_berthing_berth (berth_id),
+  KEY idx_berthing_vessel (vessel_id),
+  KEY idx_berthing_status (status),
+  CONSTRAINT fk_berthing_berth FOREIGN KEY (berth_id) REFERENCES berth (id),
+  CONSTRAINT fk_berthing_vessel FOREIGN KEY (vessel_id) REFERENCES vessel (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='靠泊记录';
+
+-- ---------------------------- 模块四：出航申报 ----------------------------
+CREATE TABLE sailing_plan (
+  id          BIGINT       NOT NULL AUTO_INCREMENT,
+  plan_no     VARCHAR(24)  NOT NULL COMMENT '申报单号',
+  vessel_id   BIGINT       NOT NULL,
+  skipper     VARCHAR(32)  NOT NULL COMMENT '船长 / 驾驶员',
+  phone       VARCHAR(20)  NOT NULL COMMENT '联系电话',
+  depart_time DATETIME     NOT NULL COMMENT '出航时间',
+  eta_return  DATETIME     NOT NULL COMMENT '预计返回时间',
+  route       VARCHAR(128) NOT NULL COMMENT '目的地 / 航线',
+  crew_count  INT          NOT NULL COMMENT '载员人数',
+  weather     VARCHAR(128) NOT NULL COMMENT '海况天气预报',
+  status      VARCHAR(16)  NOT NULL COMMENT 'PENDING 待审批/APPROVED 已批准/RETURNED 已返航/CANCELED 已取消',
+  updated_at  DATETIME     NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_plan_no (plan_no),
+  KEY idx_plan_vessel (vessel_id),
+  KEY idx_plan_status (status),
+  CONSTRAINT fk_plan_vessel FOREIGN KEY (vessel_id) REFERENCES vessel (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='出航申报';
+
+-- ---------------------------- 模块五：码头服务与费用 ----------------------------
+CREATE TABLE service_record (
+  id            BIGINT       NOT NULL AUTO_INCREMENT,
+  service_type  VARCHAR(16)  NOT NULL COMMENT 'POWER 接电/WATER 加水/FUEL 加油/HULL_WASH 船体清洗/LIFT 吊机上下排/REPAIR 维修/WASTE 污油水接收',
+  unit_price    DECIMAL(10,2) NOT NULL COMMENT '单价',
+  quantity      DECIMAL(10,2) NOT NULL COMMENT '数量',
+  amount        DECIMAL(12,2) NOT NULL COMMENT '金额 = 单价 × 数量',
+  occurred_date DATE         NOT NULL COMMENT '发生日期',
+  berth_id      BIGINT       NULL     COMMENT '关联泊位（可空）',
+  vessel_id     BIGINT       NULL     COMMENT '关联船只（可空）',
+  settle_status VARCHAR(16)  NOT NULL COMMENT 'UNSETTLED 未结/SETTLED 已结/ON_ACCOUNT 挂账',
+  updated_at    DATETIME     NULL,
+  PRIMARY KEY (id),
+  KEY idx_service_type (service_type),
+  KEY idx_service_settle (settle_status),
+  KEY idx_service_berth (berth_id),
+  KEY idx_service_vessel (vessel_id),
+  CONSTRAINT fk_service_berth FOREIGN KEY (berth_id) REFERENCES berth (id),
+  CONSTRAINT fk_service_vessel FOREIGN KEY (vessel_id) REFERENCES vessel (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='码头服务与费用';
+
+-- ============================================================================
+-- 模块六：封航令 closure_order
+--   四阶段：SCHEDULED 待生效 → EFFECTIVE 生效中 → LIFTING 解除中 → ARCHIVED 已归档
+--   生效时由系统在同一事务内快照：暂停已批准未出航申报、为每条在海船建返港处置项。
+-- ============================================================================
+CREATE TABLE closure_order (
+  id                  BIGINT       NOT NULL AUTO_INCREMENT,
+  order_no            VARCHAR(24)  NOT NULL COMMENT '封航令编号 FH-yyyyMM-####',
+  reason_type         VARCHAR(16)  NOT NULL COMMENT 'TYPHOON 台风/MARITIME_CONTROL 海事管制/WATER_RISK 突发水域风险/OTHER 其他',
+  reason_detail       VARCHAR(256) NULL     COMMENT '事由说明',
+  effective_at        DATETIME     NOT NULL COMMENT '发布生效时间（到点自动生效）',
+  status              VARCHAR(16)  NOT NULL COMMENT 'SCHEDULED 待生效/EFFECTIVE 生效中/LIFTING 解除中/ARCHIVED 已归档',
+  issued_by           VARCHAR(32)  NULL     COMMENT '发布值班主管',
+  created_at          DATETIME     NOT NULL,
+  activated_at        DATETIME     NULL     COMMENT '实际生效时间',
+  lifting_started_at  DATETIME     NULL     COMMENT '进入解除中的时间',
+  lifted_by           VARCHAR(32)  NULL     COMMENT '发起解除的值班员',
+  archived_at         DATETIME     NULL     COMMENT '归档时间',
+  archived_by         VARCHAR(32)  NULL     COMMENT '归档值班员',
+  updated_at          DATETIME     NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_closure_no (order_no),
+  KEY idx_closure_status (status),
+  KEY idx_closure_effective (effective_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='封航令';
+
+-- ============================================================================
+-- 模块七：返港处置项 return_disposition
+--   TO_CONTACT 待联系 → CONFIRMED_RETURN 已确认返港 / ESCALATED 失联升级
+--   → SAFE_BERTHED 已安全靠泊（终态）
+--   同一艘船在同一条封航令下只能有一条（uk 兜底并发）。
+-- ============================================================================
+CREATE TABLE return_disposition (
+  id                BIGINT       NOT NULL AUTO_INCREMENT,
+  closure_id        BIGINT       NOT NULL,
+  vessel_id         BIGINT       NOT NULL,
+  sailing_plan_id   BIGINT       NULL     COMMENT '封航前出海对应的已批准申报（可空）',
+  status            VARCHAR(20)  NOT NULL COMMENT 'TO_CONTACT/CONFIRMED_RETURN/ESCALATED/SAFE_BERTHED',
+  assigned_berth_id BIGINT       NULL     COMMENT '预先接纳返港的预留泊位',
+  assigned_at       DATETIME     NULL,
+  assigned_by       VARCHAR(32)  NULL,
+  confirmed_at      DATETIME     NULL,
+  escalated_at      DATETIME     NULL,
+  escalate_reason   VARCHAR(256) NULL,
+  berthed_at        DATETIME     NULL,
+  berthed_berth_id  BIGINT       NULL     COMMENT '实际安全靠泊的泊位',
+  berthed_by        VARCHAR(32)  NULL,
+  berthing_id       BIGINT       NULL     COMMENT '安全靠泊时生成的在泊靠泊记录',
+  created_at        DATETIME     NOT NULL,
+  updated_at        DATETIME     NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_disp_closure_vessel (closure_id, vessel_id),
+  KEY idx_disp_status (status),
+  KEY idx_disp_vessel (vessel_id),
+  KEY idx_disp_berth (assigned_berth_id),
+  CONSTRAINT fk_disp_closure FOREIGN KEY (closure_id) REFERENCES closure_order (id),
+  CONSTRAINT fk_disp_vessel FOREIGN KEY (vessel_id) REFERENCES vessel (id),
+  CONSTRAINT fk_disp_plan FOREIGN KEY (sailing_plan_id) REFERENCES sailing_plan (id),
+  CONSTRAINT fk_disp_assigned_berth FOREIGN KEY (assigned_berth_id) REFERENCES berth (id),
+  CONSTRAINT fk_disp_berthed_berth FOREIGN KEY (berthed_berth_id) REFERENCES berth (id),
+  CONSTRAINT fk_disp_berthing FOREIGN KEY (berthing_id) REFERENCES berthing (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='返港处置项';
+
+-- ---------------------------- 返港处置联系记录（每次联系留痕，可追溯） ----------------------------
+CREATE TABLE disposition_contact (
+  id             BIGINT       NOT NULL AUTO_INCREMENT,
+  disposition_id BIGINT       NOT NULL,
+  contact_at     DATETIME     NOT NULL COMMENT '联系时间',
+  result_code    VARCHAR(16)  NOT NULL COMMENT 'NOTIFIED 已通知/ACK 确认返港/NO_ANSWER 无人应答/ESCALATE 失联上报/SAFE 安全靠泊/OTHER 其他',
+  result_text    VARCHAR(128) NULL     COMMENT '联系结果描述',
+  remark         VARCHAR(256) NULL     COMMENT '备注',
+  operator       VARCHAR(32)  NULL     COMMENT '联系值班员',
+  request_id     VARCHAR(64)  NULL     COMMENT '幂等键：前端重复点击/超时重试同一请求只落一条',
+  created_at     DATETIME     NOT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_contact_request (request_id),
+  KEY idx_contact_disp (disposition_id),
+  CONSTRAINT fk_contact_disp FOREIGN KEY (disposition_id) REFERENCES return_disposition (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='返港处置联系记录';
+
+-- ---------------------------- 申报暂停/恢复审计日志（保留暂停原因与原审批顺序） ----------------------------
+CREATE TABLE plan_suspend_log (
+  id         BIGINT       NOT NULL AUTO_INCREMENT,
+  closure_id BIGINT       NOT NULL,
+  plan_id    BIGINT       NOT NULL,
+  action     VARCHAR(16)  NOT NULL COMMENT 'SUSPEND 暂停放行 / RESUME 恢复可审批',
+  reason     VARCHAR(256) NULL,
+  operator   VARCHAR(32)  NULL,
+  created_at DATETIME     NOT NULL,
+  PRIMARY KEY (id),
+  KEY idx_suspendlog_closure (closure_id),
+  KEY idx_suspendlog_plan (plan_id),
+  CONSTRAINT fk_suspendlog_closure FOREIGN KEY (closure_id) REFERENCES closure_order (id),
+  CONSTRAINT fk_suspendlog_plan FOREIGN KEY (plan_id) REFERENCES sailing_plan (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='申报暂停放行审计日志';
+
+-- ---------------------------- 既有表补列 ----------------------------
+-- 出航申报：暂停放行状态机与原审批顺序所需列
+ALTER TABLE sailing_plan
+  ADD COLUMN approved_at     DATETIME     NULL COMMENT '批准时间（暂停恢复后仍按此排序）' AFTER status,
+  ADD COLUMN suspended_at    DATETIME     NULL COMMENT '暂停放行时间' AFTER approved_at,
+  ADD COLUMN suspended_reason VARCHAR(256) NULL COMMENT '暂停原因（封航令编号+事由）' AFTER suspended_at,
+  ADD COLUMN resumed_at      DATETIME     NULL COMMENT '恢复可审批时间' AFTER suspended_reason;
+
+-- 出航申报增加 SUSPENDED 暂停放行（不改原有四值语义）
+-- 泊位：返港预留泊位反向指向封航令（RESERVED 状态时占用，靠泊/释放时清空）
+ALTER TABLE berth
+  ADD COLUMN reserved_return_id BIGINT NULL COMMENT '为哪条封航令预留的返港泊位' AFTER status,
+  ADD CONSTRAINT fk_berth_reserved_closure FOREIGN KEY (reserved_return_id) REFERENCES closure_order (id);
+
+-- ============================================================================
+-- 种子数据：泊位 24 个（A/B/C 区各 8 个，A 区小船位、B 区中泊位、C 区大泊位）
+-- id 1~8 = A-01~A-08，9~16 = B-01~B-08，17~24 = C-01~C-08
+-- ============================================================================
+INSERT INTO berth (id, berth_no, zone_code, pier_no, length_m, max_draft_m, allow_type, daily_rate, utility, status, updated_at) VALUES
+ (1,  'A-01', 'A', 'A1', 10.50, 1.80, 'SAIL;FISHING;SPEED',          280.00, 'POWER_WATER', 'IN_PORT',  NOW()),
+ (2,  'A-02', 'A', 'A1',  9.80, 1.60, 'SAIL;SPEED',                  260.00, 'POWER',       'IN_PORT',  NOW()),
+ (3,  'A-03', 'A', 'A1', 11.00, 2.00, 'SAIL;FISHING;SPEED',          300.00, 'POWER_WATER', 'FREE',     NOW()),
+ (4,  'A-04', 'A', 'A1', 12.00, 2.20, 'SAIL;FISHING;SPEED;POWER',    320.00, 'POWER_WATER', 'RESERVED', NOW()),
+ (5,  'A-05', 'A', 'A2', 12.00, 2.00, 'FISHING;SPEED',               300.00, 'POWER_WATER', 'IN_PORT',  NOW()),
+ (6,  'A-06', 'A', 'A2', 10.00, 1.80, 'SAIL;SPEED',                  270.00, 'WATER',       'FREE',     NOW()),
+ (7,  'A-07', 'A', 'A2', 11.50, 2.10, 'SAIL;FISHING;SPEED',          290.00, 'POWER_WATER', 'DISABLED', NOW()),
+ (8,  'A-08', 'A', 'A2', 12.50, 2.30, 'SAIL;FISHING;SPEED;POWER',    330.00, 'POWER_WATER', 'FREE',     NOW()),
+ (9,  'B-01', 'B', 'B1', 16.00, 2.60, 'POWER;CATAMARAN;FISHING',     480.00, 'POWER_WATER', 'IN_PORT',  NOW()),
+ (10, 'B-02', 'B', 'B1', 15.00, 2.40, 'POWER;CATAMARAN',             450.00, 'POWER_WATER', 'FREE',     NOW()),
+ (11, 'B-03', 'B', 'B1', 15.50, 2.20, 'CATAMARAN;POWER',             460.00, 'POWER_WATER', 'IN_PORT',  NOW()),
+ (12, 'B-04', 'B', 'B1', 15.80, 2.30, 'CATAMARAN;POWER',             470.00, 'POWER',       'IN_PORT',  NOW()),
+ (13, 'B-05', 'B', 'B2', 17.00, 2.80, 'POWER;CATAMARAN;FISHING',     520.00, 'POWER_WATER', 'RESERVED', NOW()),
+ (14, 'B-06', 'B', 'B2', 14.50, 2.30, 'POWER;FISHING',               430.00, 'WATER',       'FREE',     NOW()),
+ (15, 'B-07', 'B', 'B2', 18.00, 3.00, 'POWER;CATAMARAN;FISHING',     560.00, 'POWER_WATER', 'FREE',     NOW()),
+ (16, 'B-08', 'B', 'B2', 17.50, 2.90, 'POWER;CATAMARAN',             540.00, 'POWER_WATER', 'IN_PORT',  NOW()),
+ (17, 'C-01', 'C', 'C1', 20.00, 3.20, 'POWER;CATAMARAN',             720.00, 'POWER_WATER', 'FREE',     NOW()),
+ (18, 'C-02', 'C', 'C1', 22.00, 3.40, 'POWER;CATAMARAN',             780.00, 'POWER_WATER', 'IN_PORT',  NOW()),
+ (19, 'C-03', 'C', 'C1', 24.00, 3.60, 'POWER;CATAMARAN',             860.00, 'POWER_WATER', 'DISABLED', NOW()),
+ (20, 'C-04', 'C', 'C1', 19.00, 3.00, 'POWER;CATAMARAN',             680.00, 'POWER',       'FREE',     NOW()),
+ (21, 'C-05', 'C', 'C2', 18.50, 2.80, 'POWER;CATAMARAN;SPEED',       660.00, 'POWER_WATER', 'IN_PORT',  NOW()),
+ (22, 'C-06', 'C', 'C2', 21.00, 3.30, 'POWER;CATAMARAN',             740.00, 'POWER_WATER', 'FREE',     NOW()),
+ (23, 'C-07', 'C', 'C2', 25.00, 3.80, 'POWER;CATAMARAN',             920.00, 'POWER_WATER', 'FREE',     NOW()),
+ (24, 'C-08', 'C', 'C2', 23.00, 3.50, 'POWER;CATAMARAN',             800.00, 'POWER_WATER', 'FREE',     NOW());
+
+-- ============================================================================
+-- 种子数据：船只 15 艘（在港 9 / 出海 4 / 维修 1 / 退租 1）
+-- ============================================================================
+INSERT INTO vessel (id, name, reg_no, owner_name, type_code, length_m, width_m, draft_m, reg_date, insurance_due, status, updated_at) VALUES
+ (1,  '海风号',   'CN-YC-1001', '陈志远', 'SAIL',       9.80,  3.20, 1.50, '2021-04-18', DATE_ADD(CURDATE(), INTERVAL 240 DAY), 'IN_PORT',     NOW()),
+ (2,  '逐浪者',   'CN-YC-1002', '林浩',   'SPEED',      8.60,  2.80, 0.90, '2022-06-11', DATE_ADD(CURDATE(), INTERVAL 180 DAY), 'IN_PORT',     NOW()),
+ (3,  '碧海钓翁', 'CN-YC-1003', '周国平', 'FISHING',   11.20,  3.60, 1.60, '2019-09-03', DATE_ADD(CURDATE(), INTERVAL  12 DAY), 'IN_PORT',     NOW()),
+ (4,  '珊瑚湾',   'CN-YC-1004', '苏婉',   'CATAMARAN', 13.80,  6.50, 1.10, '2020-05-20', DATE_ADD(CURDATE(), INTERVAL 300 DAY), 'IN_PORT',     NOW()),
+ (5,  '远航者',   'CN-YC-1005', '何建明', 'POWER',     15.60,  4.60, 2.20, '2018-03-15', DATE_ADD(CURDATE(), INTERVAL 120 DAY), 'IN_PORT',     NOW()),
+ (6,  '白帆',     'CN-YC-1006', '邓子谦', 'SAIL',      10.40,  3.30, 1.70, '2021-11-28', DATE_ADD(CURDATE(), INTERVAL 260 DAY), 'OUT_SEA',     NOW()),
+ (7,  '疾风',     'CN-YC-1007', '郑凯',   'SPEED',      7.90,  2.60, 0.80, '2023-02-09', DATE_ADD(CURDATE(), INTERVAL 200 DAY), 'OUT_SEA',     NOW()),
+ (8,  '海钓王',   'CN-YC-1008', '吴德海', 'FISHING',   10.80,  3.40, 1.40, '2020-08-17', DATE_ADD(CURDATE(), INTERVAL  90 DAY), 'OUT_SEA',     NOW()),
+ (9,  '双子星',   'CN-YC-1009', '梁静怡', 'CATAMARAN', 14.20,  6.80, 1.20, '2022-01-25', DATE_SUB(CURDATE(), INTERVAL   5 DAY), 'IN_PORT',     NOW()),
+ (10, '蓝鲸号',   'CN-YC-1010', '马文杰', 'POWER',     18.60,  5.20, 2.60, '2017-07-06', DATE_ADD(CURDATE(), INTERVAL 150 DAY), 'MAINTENANCE', NOW()),
+ (11, '晨曦',     'CN-YC-1011', '叶知秋', 'SAIL',      11.60,  3.50, 1.80, '2023-05-19', DATE_ADD(CURDATE(), INTERVAL 330 DAY), 'OUT_SEA',     NOW()),
+ (12, '追潮',     'CN-YC-1012', '高翔',   'SPEED',     12.40,  3.10, 1.00, '2021-10-02', DATE_ADD(CURDATE(), INTERVAL 210 DAY), 'IN_PORT',     NOW()),
+ (13, '海之韵',   'CN-YC-1013', '罗启明', 'POWER',     16.80,  4.90, 2.50, '2019-12-12', DATE_ADD(CURDATE(), INTERVAL  25 DAY), 'IN_PORT',     NOW()),
+ (14, '老船长',   'CN-YC-1014', '徐福生', 'FISHING',    9.60,  3.10, 1.30, '2016-04-08', DATE_ADD(CURDATE(), INTERVAL  60 DAY), 'TERMINATED',  NOW()),
+ (15, '银河',     'CN-YC-1015', '白露',   'CATAMARAN', 16.50,  7.20, 1.50, '2021-08-30', DATE_ADD(CURDATE(), INTERVAL 170 DAY), 'IN_PORT',     NOW());
+
+-- ============================================================================
+-- 种子数据：靠泊记录 22 条（在泊 9 条 + 已结算离泊 13 条）
+-- 在泊这 9 条就是 @JoinFormula 派生关联的数据来源
+-- ============================================================================
+INSERT INTO berthing (id, record_no, berth_id, vessel_id, berth_time, eta_depart, actual_depart, days, fee, status, updated_at) VALUES
+ -- 在泊（对应 berth.status = IN_PORT）
+ (1,  'KP-2026-0001',  1,  1, DATE_SUB(NOW(), INTERVAL  3 DAY), DATE_ADD(NOW(), INTERVAL 2 DAY), NULL, NULL, NULL, 'IN_PORT', NOW()),
+ (2,  'KP-2026-0002',  2,  2, DATE_SUB(NOW(), INTERVAL  6 DAY), DATE_ADD(NOW(), INTERVAL 1 DAY), NULL, NULL, NULL, 'IN_PORT', NOW()),
+ (3,  'KP-2026-0003',  5,  3, DATE_SUB(NOW(), INTERVAL  2 DAY), DATE_ADD(NOW(), INTERVAL 4 DAY), NULL, NULL, NULL, 'IN_PORT', NOW()),
+ (4,  'KP-2026-0004',  9,  5, DATE_SUB(NOW(), INTERVAL 11 DAY), DATE_ADD(NOW(), INTERVAL 3 DAY), NULL, NULL, NULL, 'IN_PORT', NOW()),
+ (5,  'KP-2026-0005', 11,  4, DATE_SUB(NOW(), INTERVAL  5 DAY), DATE_ADD(NOW(), INTERVAL 6 DAY), NULL, NULL, NULL, 'IN_PORT', NOW()),
+ (6,  'KP-2026-0006', 12,  9, DATE_SUB(NOW(), INTERVAL  1 DAY), DATE_ADD(NOW(), INTERVAL 5 DAY), NULL, NULL, NULL, 'IN_PORT', NOW()),
+ (7,  'KP-2026-0007', 16, 13, DATE_SUB(NOW(), INTERVAL  8 DAY), DATE_ADD(NOW(), INTERVAL 2 DAY), NULL, NULL, NULL, 'IN_PORT', NOW()),
+ (8,  'KP-2026-0008', 18, 15, DATE_SUB(NOW(), INTERVAL  4 DAY), DATE_ADD(NOW(), INTERVAL 7 DAY), NULL, NULL, NULL, 'IN_PORT', NOW()),
+ (9,  'KP-2026-0009', 21, 12, DATE_SUB(NOW(), INTERVAL  9 DAY), DATE_ADD(NOW(), INTERVAL 1 DAY), NULL, NULL, NULL, 'IN_PORT', NOW()),
+ -- 已结算离泊（fee = days × 泊位日租金）
+ (10, 'KP-2026-0010',  1,  6, DATE_SUB(NOW(), INTERVAL 40 DAY), NULL, DATE_SUB(NOW(), INTERVAL 36 DAY),  4, 1120.00, 'SETTLED', NOW()),
+ (11, 'KP-2026-0011',  3,  7, DATE_SUB(NOW(), INTERVAL 30 DAY), NULL, DATE_SUB(NOW(), INTERVAL 27 DAY),  3,  900.00, 'SETTLED', NOW()),
+ (12, 'KP-2026-0012',  6, 14, DATE_SUB(NOW(), INTERVAL 60 DAY), NULL, DATE_SUB(NOW(), INTERVAL 52 DAY),  8, 2160.00, 'SETTLED', NOW()),
+ (13, 'KP-2026-0013',  7,  8, DATE_SUB(NOW(), INTERVAL 25 DAY), NULL, DATE_SUB(NOW(), INTERVAL 22 DAY),  3,  870.00, 'SETTLED', NOW()),
+ (14, 'KP-2026-0014',  8, 11, DATE_SUB(NOW(), INTERVAL 20 DAY), NULL, DATE_SUB(NOW(), INTERVAL 14 DAY),  6, 1980.00, 'SETTLED', NOW()),
+ (15, 'KP-2026-0015', 10,  5, DATE_SUB(NOW(), INTERVAL 45 DAY), NULL, DATE_SUB(NOW(), INTERVAL 38 DAY),  7, 3150.00, 'SETTLED', NOW()),
+ (16, 'KP-2026-0016', 13, 13, DATE_SUB(NOW(), INTERVAL 35 DAY), NULL, DATE_SUB(NOW(), INTERVAL 30 DAY),  5, 2600.00, 'SETTLED', NOW()),
+ (17, 'KP-2026-0017', 14,  9, DATE_SUB(NOW(), INTERVAL 28 DAY), NULL, DATE_SUB(NOW(), INTERVAL 24 DAY),  4, 1720.00, 'SETTLED', NOW()),
+ (18, 'KP-2026-0018', 15, 10, DATE_SUB(NOW(), INTERVAL 50 DAY), NULL, DATE_SUB(NOW(), INTERVAL 44 DAY),  6, 3360.00, 'SETTLED', NOW()),
+ (19, 'KP-2026-0019', 17, 15, DATE_SUB(NOW(), INTERVAL 33 DAY), NULL, DATE_SUB(NOW(), INTERVAL 28 DAY),  5, 3600.00, 'SETTLED', NOW()),
+ (20, 'KP-2026-0020', 19,  5, DATE_SUB(NOW(), INTERVAL 70 DAY), NULL, DATE_SUB(NOW(), INTERVAL 65 DAY),  5, 4300.00, 'SETTLED', NOW()),
+ (21, 'KP-2026-0021', 22, 12, DATE_SUB(NOW(), INTERVAL 18 DAY), NULL, DATE_SUB(NOW(), INTERVAL 15 DAY),  3, 2220.00, 'SETTLED', NOW()),
+ (22, 'KP-2026-0022', 24,  4, DATE_SUB(NOW(), INTERVAL 26 DAY), NULL, DATE_SUB(NOW(), INTERVAL 21 DAY),  5, 4000.00, 'SETTLED', NOW());
+
+-- ============================================================================
+-- 种子数据：出航申报 12 条（待审批 3 / 已批准 4 其中 2 条超期未返 / 已返航 4 / 已取消 1）
+-- ============================================================================
+INSERT INTO sailing_plan (id, plan_no, vessel_id, skipper, phone, depart_time, eta_return, route, crew_count, weather, status, updated_at) VALUES
+ (1,  'SP-2026-0001',  1, '陈志远', '13905510001', DATE_ADD(NOW(), INTERVAL  1 DAY), DATE_ADD(NOW(), INTERVAL  2 DAY), '东澳岛 — 环岛航线',        4, '东南风 3 级，浪高 0.6m，能见度良好', 'PENDING',  NOW()),
+ (2,  'SP-2026-0002', 13, '罗启明', '13905510013', DATE_ADD(NOW(), INTERVAL  2 DAY), DATE_ADD(NOW(), INTERVAL  3 DAY), '万山群岛 — 北线',          6, '东北风 4 级，浪高 1.2m，午后有阵雨', 'PENDING',  NOW()),
+ (3,  'SP-2026-0003',  5, '何建明', '13905510005', DATE_ADD(NOW(), INTERVAL  3 DAY), DATE_ADD(NOW(), INTERVAL  5 DAY), '外伶仃岛 — 东湾锚地',      8, '西南风 3 级，浪高 0.8m，海况平稳',   'PENDING',  NOW()),
+ (4,  'SP-2026-0004',  6, '邓子谦', '13905510006', DATE_SUB(NOW(), INTERVAL  2 DAY), DATE_ADD(NOW(), INTERVAL  1 DAY), '桂山岛 — 西堤水域',        5, '东风 4 级，浪高 1.0m，夜间转静',     'APPROVED', NOW()),
+ (5,  'SP-2026-0005',  7, '郑凯',   '13905510007', DATE_SUB(NOW(), INTERVAL  1 DAY), DATE_ADD(NOW(), INTERVAL  1 DAY), '庙湾 — 珊瑚礁潜点',        3, '东南风 3 级，浪高 0.7m，适合潜水',   'APPROVED', NOW()),
+ (6,  'SP-2026-0006',  8, '吴德海', '13905510008', DATE_SUB(NOW(), INTERVAL 30 HOUR), DATE_SUB(NOW(), INTERVAL  6 HOUR), '担杆岛 — 外海钓场',       4, '东北风 5 级，浪高 1.6m，已发大风提示', 'APPROVED', NOW()),
+ (7,  'SP-2026-0007', 11, '叶知秋', '13905510011', DATE_SUB(NOW(), INTERVAL 52 HOUR), DATE_SUB(NOW(), INTERVAL 28 HOUR), '外海训练航线 — 折返跑',   6, '南风 4 级，浪高 1.3m，能见度 6km',   'APPROVED', NOW()),
+ (8,  'SP-2026-0008',  2, '林浩',   '13905510002', DATE_SUB(NOW(), INTERVAL  5 DAY), DATE_SUB(NOW(), INTERVAL  4 DAY), '近岸试航 — 5 海里折返',   2, '微风 2 级，浪高 0.3m，海况优',       'RETURNED', NOW()),
+ (9,  'SP-2026-0009', 15, '白露',   '13905510015', DATE_SUB(NOW(), INTERVAL  7 DAY), DATE_SUB(NOW(), INTERVAL  6 DAY), '珠澳口岸水域 — 观光航线', 10, '东南风 3 级，浪高 0.9m，适航',       'RETURNED', NOW()),
+ (10, 'SP-2026-0010',  3, '周国平', '13905510003', DATE_SUB(NOW(), INTERVAL  9 DAY), DATE_SUB(NOW(), INTERVAL  8 DAY), '青洲钓场 — 夜钓',          4, '北风 3 级，浪高 0.5m，夜间降温',     'RETURNED', NOW()),
+ (11, 'SP-2026-0011', 12, '高翔',   '13905510012', DATE_SUB(NOW(), INTERVAL  3 DAY), DATE_SUB(NOW(), INTERVAL  2 DAY), '东澳岛 — 南沙湾',          3, '东北风 6 级，浪高 2.0m，不适航',     'CANCELED', NOW()),
+ (12, 'SP-2026-0012',  1, '陈志远', '13905510001', DATE_SUB(NOW(), INTERVAL 12 DAY), DATE_SUB(NOW(), INTERVAL 11 DAY), '桂山岛 — 环岛',            4, '东南风 2 级，浪高 0.4m，海况优',     'RETURNED', NOW());
+
+-- 已批准的申报回填批准时间（封航暂停恢复后仍按原审批顺序审批）
+UPDATE sailing_plan SET approved_at = updated_at WHERE status = 'APPROVED';
+
+-- ============================================================================
+-- 种子数据：码头服务与费用 16 条（未结 5 / 已结 9 / 挂账 2，横跨近 45 天）
+-- ============================================================================
+INSERT INTO service_record (id, service_type, unit_price, quantity, amount, occurred_date, berth_id, vessel_id, settle_status, updated_at) VALUES
+ (1,  'POWER',      12.00, 120.00, 1440.00, DATE_SUB(CURDATE(), INTERVAL  5 DAY),  1,  1, 'UNSETTLED',  NOW()),
+ (2,  'WATER',      15.00,   8.00,  120.00, DATE_SUB(CURDATE(), INTERVAL  4 DAY),  1,  1, 'SETTLED',    NOW()),
+ (3,  'FUEL',        8.60, 200.00, 1720.00, DATE_SUB(CURDATE(), INTERVAL  3 DAY),  9,  5, 'UNSETTLED',  NOW()),
+ (4,  'HULL_WASH',  45.00,  15.60,  702.00, DATE_SUB(CURDATE(), INTERVAL  2 DAY),  9,  5, 'SETTLED',    NOW()),
+ (5,  'LIFT',      680.00,   1.00,  680.00, DATE_SUB(CURDATE(), INTERVAL 12 DAY), 17, 15, 'SETTLED',    NOW()),
+ (6,  'REPAIR',    260.00,   6.00, 1560.00, DATE_SUB(CURDATE(), INTERVAL 15 DAY),  7,  8, 'ON_ACCOUNT', NOW()),
+ (7,  'WASTE',     120.00,   2.00,  240.00, DATE_SUB(CURDATE(), INTERVAL  8 DAY), 11,  4, 'UNSETTLED',  NOW()),
+ (8,  'POWER',      12.00,  86.00, 1032.00, DATE_SUB(CURDATE(), INTERVAL 20 DAY), 16, 13, 'SETTLED',    NOW()),
+ (9,  'FUEL',        8.60, 350.00, 3010.00, DATE_SUB(CURDATE(), INTERVAL 25 DAY), 18, 15, 'SETTLED',    NOW()),
+ (10, 'HULL_WASH',  45.00,  22.00,  990.00, DATE_SUB(CURDATE(), INTERVAL 30 DAY), 18, 15, 'UNSETTLED',  NOW()),
+ (11, 'WATER',      15.00,  12.00,  180.00, DATE_SUB(CURDATE(), INTERVAL  6 DAY),  2,  2, 'SETTLED',    NOW()),
+ (12, 'REPAIR',    260.00,   3.50,  910.00, DATE_SUB(CURDATE(), INTERVAL 18 DAY), 12,  9, 'ON_ACCOUNT', NOW()),
+ (13, 'POWER',      12.00, 210.00, 2520.00, DATE_SUB(CURDATE(), INTERVAL 40 DAY), 21, 12, 'SETTLED',    NOW()),
+ (14, 'LIFT',      680.00,   2.00, 1360.00, DATE_SUB(CURDATE(), INTERVAL 45 DAY), 19, 10, 'SETTLED',    NOW()),
+ (15, 'WASTE',     120.00,   1.00,  120.00, DATE_SUB(CURDATE(), INTERVAL 10 DAY),  5,  3, 'UNSETTLED',  NOW()),
+ (16, 'FUEL',        8.60,  90.00,  774.00, DATE_SUB(CURDATE(), INTERVAL  1 DAY),  2,  2, 'UNSETTLED',  NOW());
+
+-- ============================================================================
+-- 模块八：船只过户交割 ownership_transfer
+--
+-- 设计底线（对应验收口径）：
+--   1. 过户绝不只是改 vessel.owner_name。责任归属落在 fact_attribution 台账：
+--      靠泊 / 出航 / 服务三类事实按「交割生效时点」逐项判定 OLD（旧船主）/
+--      NEW（新船主）/ SPLIT（按区间拆账）/ PENDING（归属待判）。
+--   2. 生效前已完成的事实保留旧归属；生效后的联系、运营责任与新增费用归新船主；
+--      跨越时点的在泊记录按日租金 × 实际区间拆成两段（不破坏原记录，另立新段）；
+--      无法按区间拆分的持续服务 / 在海申报必须由工作人员选承担方并写理由。
+--   3. 历史数据缺当时船主或服务起止区间：原记录原样保留、标为归属待判（PENDING），
+--      工作人员补依据后才能定责；禁止按当前船主批量改写。
+--   4. 交割单、归属台账、更正说明全部 append-only：不得删除，更正只能追加。
+--
+-- 表清单（建表顺序同时满足外键依赖）：
+--   owner_profile          船主名录（电话等联系资料，只对码头运营人员完整可见）
+--   ownership_transfer     过户交割单（双方资料 + 生效时点 + 交割说明 + 操作者）
+--   vessel_owner_period    船只持有区间（append-only，查询「某时刻船主」的时间轴）
+--   transfer_correction    交割更正说明（append-only）
+--   fact_attribution       每项事实（靠泊/出航/服务）的责任归属台账（append-only）
+-- ============================================================================
+
+-- ---------------------------- 船主名录 ----------------------------
+CREATE TABLE owner_profile (
+  id          BIGINT       NOT NULL AUTO_INCREMENT,
+  owner_name  VARCHAR(32)  NOT NULL COMMENT '船主姓名',
+  phone       VARCHAR(20)  NULL     COMMENT '联系电话（不对其他船主可见）',
+  id_card     VARCHAR(32)  NULL     COMMENT '证件号（仅码头运营人员可见）',
+  remark      VARCHAR(256) NULL     COMMENT '内部备注（仅码头运营人员可见）',
+  created_at  DATETIME     NOT NULL,
+  updated_at  DATETIME     NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_owner_name (owner_name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='船主名录';
+
+-- ---------------------------- 过户交割单 ----------------------------
+CREATE TABLE ownership_transfer (
+  id            BIGINT       NOT NULL AUTO_INCREMENT,
+  transfer_no   VARCHAR(24)  NOT NULL COMMENT '交割单号 GH-yyyyMM-####',
+  vessel_id     BIGINT       NOT NULL,
+  old_owner_id  BIGINT       NOT NULL COMMENT '原船主（快照指向名录）',
+  new_owner_id  BIGINT       NOT NULL COMMENT '新船主（可为新登记名录）',
+  effective_at  DATETIME     NOT NULL COMMENT '交割生效时点（责任分界）',
+  note          VARCHAR(512) NULL     COMMENT '交割说明',
+  status        VARCHAR(16)  NOT NULL COMMENT 'DONE 已完成（交割单不可删除，只能追加更正）',
+  operator      VARCHAR(32)  NOT NULL COMMENT '办理交割的码头工作人员',
+  created_at    DATETIME     NOT NULL,
+  completed_at  DATETIME     NOT NULL,
+  updated_at    DATETIME     NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_transfer_no (transfer_no),
+  KEY idx_transfer_vessel (vessel_id),
+  KEY idx_transfer_old (old_owner_id),
+  KEY idx_transfer_new (new_owner_id),
+  CONSTRAINT fk_transfer_vessel FOREIGN KEY (vessel_id) REFERENCES vessel (id),
+  CONSTRAINT fk_transfer_old FOREIGN KEY (old_owner_id) REFERENCES owner_profile (id),
+  CONSTRAINT fk_transfer_new FOREIGN KEY (new_owner_id) REFERENCES owner_profile (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='船只过户交割单（append-only）';
+
+-- ---------------------------- 船只持有区间（append-only 时间轴） ----------------------------
+CREATE TABLE vessel_owner_period (
+  id          BIGINT       NOT NULL AUTO_INCREMENT,
+  vessel_id   BIGINT       NOT NULL,
+  owner_id    BIGINT       NOT NULL,
+  start_at    DATETIME     NOT NULL COMMENT '自何时起持有（含）',
+  end_at      DATETIME     NULL     COMMENT '至何时止（不含）；NULL=持有至今',
+  basis       VARCHAR(256) NOT NULL COMMENT '区间依据：初始登记 / 交割单 GH-xxxx',
+  transfer_id BIGINT       NULL     COMMENT '由哪张交割单切出',
+  created_at  DATETIME     NOT NULL,
+  PRIMARY KEY (id),
+  KEY idx_period_vessel (vessel_id, start_at),
+  KEY idx_period_owner (owner_id),
+  CONSTRAINT fk_period_vessel FOREIGN KEY (vessel_id) REFERENCES vessel (id),
+  CONSTRAINT fk_period_owner FOREIGN KEY (owner_id) REFERENCES owner_profile (id),
+  CONSTRAINT fk_period_transfer FOREIGN KEY (transfer_id) REFERENCES ownership_transfer (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='船只持有区间（append-only）';
+
+-- ---------------------------- 交割更正说明（只能追加） ----------------------------
+CREATE TABLE transfer_correction (
+  id          BIGINT       NOT NULL AUTO_INCREMENT,
+  transfer_id BIGINT       NOT NULL,
+  text        VARCHAR(512) NOT NULL COMMENT '更正说明（不改写原记录，只追加）',
+  operator    VARCHAR(32)  NOT NULL,
+  created_at  DATETIME     NOT NULL,
+  PRIMARY KEY (id),
+  KEY idx_corr_transfer (transfer_id),
+  CONSTRAINT fk_corr_transfer FOREIGN KEY (transfer_id) REFERENCES ownership_transfer (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='过户交割更正说明（append-only）';
+
+-- ---------------------------- 事实责任归属台账（每项靠泊/出航/服务一条） ----------------------------
+-- 同一条事实若事后改判，不动旧行：旧行置 SUPERSEDED 并由 superseded_by 指向新行，链条完整。
+CREATE TABLE fact_attribution (
+  id             BIGINT        NOT NULL AUTO_INCREMENT,
+  transfer_id    BIGINT        NULL     COMMENT '由哪张交割单产生（历史补判为空）',
+  vessel_id      BIGINT        NOT NULL,
+  owner_id       BIGINT        NULL     COMMENT '无交割单的历史补判行，用此列钉住责任船主',
+  fact_type      VARCHAR(16)   NOT NULL COMMENT 'BERTHING 靠泊 / SAILING 出航 / SERVICE 服务',
+  fact_id        BIGINT        NOT NULL COMMENT '对应业务表主键',
+  split_from_id  BIGINT        NULL     COMMENT '本条是从哪条原记录拆出的新段（原记录保留）',
+  party          VARCHAR(16)   NOT NULL COMMENT 'OLD 旧船主 / NEW 新船主 / SPLIT 双方按区间 / PENDING 待判',
+  resolution     VARCHAR(24)   NOT NULL COMMENT 'AUTO_TIME 按时间/AUTO_SPLIT_BERTHING 泊段拆账/AUTO_SPLIT_DAYS 按天拆账/MANUAL 人工定责/MANUAL_SPLIT 人工拆账/LEGACY_RECONCILED 历史补判',
+  basis          VARCHAR(512)  NULL     COMMENT '判定依据 / 人工理由（人工定责必填）',
+  period_start   DATETIME      NULL     COMMENT '该责任段实际发生区间起（含）',
+  period_end     DATETIME      NULL     COMMENT '该责任段实际发生区间止（不含；在泊/在续为 NULL）',
+  amount_old     DECIMAL(12,2) NULL     COMMENT '拆账归旧船主金额',
+  amount_new     DECIMAL(12,2) NULL     COMMENT '拆账归新船主金额',
+  status         VARCHAR(16)   NOT NULL COMMENT 'PENDING 归属待判 / DONE 已定 / SUPERSEDED 已被新行更正',
+  source         VARCHAR(16)   NOT NULL COMMENT 'TRANSFER 交割定责 / LEGACY 历史数据待判',
+  superseded_by  BIGINT        NULL     COMMENT '改判后指向的新归属行',
+  operator       VARCHAR(32)   NULL     COMMENT '定责/补判操作者',
+  created_at     DATETIME      NOT NULL,
+  updated_at     DATETIME      NULL,
+  PRIMARY KEY (id),
+  KEY idx_attr_fact (fact_type, fact_id),
+  KEY idx_attr_vessel (vessel_id),
+  KEY idx_attr_transfer (transfer_id),
+  KEY idx_attr_status (status),
+  KEY idx_attr_party (party),
+  KEY idx_attr_owner (owner_id),
+  CONSTRAINT fk_attr_transfer FOREIGN KEY (transfer_id) REFERENCES ownership_transfer (id),
+  CONSTRAINT fk_attr_vessel FOREIGN KEY (vessel_id) REFERENCES vessel (id),
+  CONSTRAINT fk_attr_owner FOREIGN KEY (owner_id) REFERENCES owner_profile (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='事实责任归属台账（append-only）';
+
+-- ---------------------------- 既有表补列 ----------------------------
+-- 船只：当前船主外键（owner_name 保留为姓名快照，真相以持有区间时间轴 + 此外键为准）
+ALTER TABLE vessel
+  ADD COLUMN current_owner_id BIGINT NULL COMMENT '当前船主（名录外键）' AFTER owner_name,
+  ADD CONSTRAINT fk_vessel_current_owner FOREIGN KEY (current_owner_id) REFERENCES owner_profile (id);
+
+-- 服务记录：持续服务起止区间、责任船主快照、欠费说明与内部备注（后两者仅运营人员可见）
+ALTER TABLE service_record
+  ADD COLUMN service_kind    VARCHAR(16)   NOT NULL DEFAULT 'POINT'
+      COMMENT 'POINT 一次性 / CONTINUOUS 持续服务' AFTER service_type,
+  ADD COLUMN start_date      DATE          NULL COMMENT '持续服务起' AFTER occurred_date,
+  ADD COLUMN end_date        DATE          NULL COMMENT '持续服务止（NULL=仍在续）' AFTER start_date,
+  ADD COLUMN owner_id        BIGINT        NULL
+      COMMENT '责任船主快照（NULL 的历史记录按归属台账判定）' AFTER vessel_id,
+  ADD COLUMN debt_note       VARCHAR(256)  NULL COMMENT '欠费说明（仅码头运营人员可见）' AFTER settle_status,
+  ADD COLUMN internal_remark VARCHAR(256)  NULL COMMENT '内部备注（仅码头运营人员可见）' AFTER debt_note,
+  ADD COLUMN legacy_note     VARCHAR(256)  NULL COMMENT '历史导入缺据说明' AFTER internal_remark,
+  ADD KEY idx_service_owner (owner_id),
+  ADD CONSTRAINT fk_service_owner FOREIGN KEY (owner_id) REFERENCES owner_profile (id);
+
+-- 出航申报：跨交割在海申报转新船主后，联系电话需新船主更新（运营责任移交）
+ALTER TABLE sailing_plan
+  ADD COLUMN contact_handoff TINYINT(1) NOT NULL DEFAULT 0
+      COMMENT '交割后联系人待更新：1=新船主须补录本船新联系电话' AFTER phone;
+
+-- ============================================================================
+-- 种子数据：船主名录 15 人（与 15 艘船初始船主一致）
+-- ============================================================================
+INSERT INTO owner_profile (id, owner_name, phone, id_card, remark, created_at, updated_at) VALUES
+ (1,  '陈志远', '13905510001', NULL, NULL, NOW(), NOW()),
+ (2,  '林浩',   '13905510002', NULL, NULL, NOW(), NOW()),
+ (3,  '周国平', '13905510003', NULL, NULL, NOW(), NOW()),
+ (4,  '苏婉',   '13905510004', NULL, NULL, NOW(), NOW()),
+ (5,  '何建明', '13905510005', NULL, NULL, NOW(), NOW()),
+ (6,  '邓子谦', '13905510006', NULL, NULL, NOW(), NOW()),
+ (7,  '郑凯',   '13905510007', NULL, NULL, NOW(), NOW()),
+ (8,  '吴德海', '13905510008', NULL, NULL, NOW(), NOW()),
+ (9,  '梁静怡', '13905510009', NULL, NULL, NOW(), NOW()),
+ (10, '马文杰', '13905510010', NULL, NULL, NOW(), NOW()),
+ (11, '叶知秋', '13905510011', NULL, NULL, NOW(), NOW()),
+ (12, '高翔',   '13905510012', NULL, NULL, NOW(), NOW()),
+ (13, '罗启明', '13905510013', NULL, NULL, NOW(), NOW()),
+ (14, '徐福生', '13905510014', NULL, NULL, NOW(), NOW()),
+ (15, '白露',   '13905510015', NULL, NULL, NOW(), NOW());
+
+-- 船只当前船主 = 初始船主
+UPDATE vessel v JOIN owner_profile o ON o.owner_name = v.owner_name
+  SET v.current_owner_id = o.id;
+
+-- 每艘船一条「持有至今」区间（自登记日起），之后过户只把旧区间收口、另开新区间，不改旧行
+INSERT INTO vessel_owner_period (vessel_id, owner_id, start_at, end_at, basis, transfer_id, created_at)
+SELECT v.id, v.current_owner_id, CAST(v.reg_date AS DATETIME), NULL, '初始登记', NULL, NOW()
+FROM vessel v;
+
+-- ============================================================================
+-- 种子数据：海风号（id=1）额外 4 条服务，专用于演示过户分责
+--   17 持续维修、仍在续、未结 + 欠费说明/内部备注 → 跨交割时点不可自动拆，必须人工选承担方
+--   18 持续维修、已结清（区间完整）               → 若生效点落在区间内可按天自动拆账
+--   19 历史导入持续接电、缺起止区间、未结         → 归属待判（PENDING），补依据前不定责
+--   20 持续接电、区间完整、已结清                 → 区间跨生效点时按天自动拆账
+-- ============================================================================
+INSERT INTO service_record
+  (id, service_type, service_kind, unit_price, quantity, amount, occurred_date, start_date, end_date,
+   berth_id, vessel_id, owner_id, settle_status, debt_note, internal_remark, legacy_note, updated_at)
+VALUES
+ (17, 'REPAIR', 'CONTINUOUS', 260.00, 8.00, 2080.00,
+      DATE_SUB(CURDATE(), INTERVAL 10 DAY), DATE_SUB(CURDATE(), INTERVAL 10 DAY), NULL,
+      1, 1, NULL, 'UNSETTLED',
+      '发动机维修尾款，已两次催缴未付，约定过户前由陈志远结清',
+      '维修期间另发现螺旋桨磨损，建议交割时现场复验后再移交',
+      NULL, NOW()),
+ (18, 'REPAIR', 'CONTINUOUS', 260.00, 3.00, 780.00,
+      DATE_SUB(CURDATE(), INTERVAL 20 DAY), DATE_SUB(CURDATE(), INTERVAL 20 DAY), DATE_SUB(CURDATE(), INTERVAL 12 DAY),
+      1, 1, NULL, 'SETTLED', NULL, NULL, NULL, NOW()),
+ (19, 'POWER',  'CONTINUOUS', 12.00, 50.00, 600.00,
+      DATE_SUB(CURDATE(), INTERVAL 90 DAY), NULL, NULL,
+      1, 1, NULL, 'UNSETTLED',
+      '历史旧账，双方需提供抄表/缴费凭证后才能确认由谁承担',
+      NULL,
+      '2025 年纸质台账导入，原始起止抄表区间缺失，禁止按当前船主直接定责',
+      NOW()),
+ (20, 'POWER',  'CONTINUOUS', 12.00, 100.00, 1200.00,
+      DATE_SUB(CURDATE(), INTERVAL 8 DAY), DATE_SUB(CURDATE(), INTERVAL 8 DAY), DATE_SUB(CURDATE(), INTERVAL 1 DAY),
+      1, 1, NULL, 'SETTLED', NULL, NULL, NULL, NOW());
+
+-- 海风号这条历史缺据持续接电（id=19）直接挂一条 PENDING 归属台账：原始事实保留、责任待定
+INSERT INTO fact_attribution
+  (transfer_id, vessel_id, fact_type, fact_id, split_from_id, party, resolution, basis,
+   period_start, period_end, amount_old, amount_new, status, source, superseded_by, operator, created_at, updated_at)
+VALUES
+ (NULL, 1, 'SERVICE', 19, NULL, 'PENDING', 'LEGACY_RECONCILED',
+  '历史导入缺起止区间，待双方提供缴费凭证后由工作人员补判，暂不按当前船主定责',
+  NULL, NULL, NULL, NULL, 'PENDING', 'LEGACY', NULL, NULL, NOW(), NOW());

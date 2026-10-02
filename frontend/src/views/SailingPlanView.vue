@@ -1,0 +1,270 @@
+<template>
+  <div>
+    <el-alert
+      v-if="closureEffective"
+      class="closure-banner"
+      type="error"
+      :closable="false"
+      show-icon
+      title="封航令生效中：新申报可保存为待审批但暂不能批准；已批准未出航的申报已暂停放行，不能直接取消或返航"
+    >
+      <template #default>
+        <div>请在
+          <el-link type="primary" :underline="false" @click="$router.push('/closures')">「封航返港」处置台</el-link>
+          处理；解除封航后暂停申报自动恢复为可继续审批，保留原审批顺序与暂停原因。
+        </div>
+      </template>
+    </el-alert>
+
+    <div class="panel">
+      <div class="panel-head">
+        <h3>出航申报</h3>
+        <span class="panel-sub">待审批 → 已批准（封航时可暂停放行）→ 已返航 / 已取消；已批准且超过预计返回时间的整行标红</span>
+        <div class="panel-extra">
+          <el-select v-model="statusFilter" clearable placeholder="全部状态" style="width:130px" @change="load">
+            <el-option v-for="s in PLAN_STATUS" :key="s.value" :label="s.label" :value="s.value" />
+          </el-select>
+          <el-button type="primary" @click="openCreate">新建申报</el-button>
+          <el-button @click="load">刷新</el-button>
+          <el-tag v-if="!isStaff" size="small" type="info" effect="plain">
+            船主可申报；审批/出港/返航由码头办理
+          </el-tag>
+        </div>
+      </div>
+
+      <el-table :data="plans" size="small" border stripe :row-class-name="rowClass">
+        <el-table-column prop="planNo" label="申报单号" width="130" />
+        <el-table-column prop="vesselName" label="船只" width="110">
+          <template #default="{ row }">
+            {{ row.vesselName }}
+            <div class="muted" style="font-size:11px">
+              {{ row.vesselTypeName }} ·
+              <template v-if="row.vesselAtSea">在海</template>
+              <template v-else>{{ row.berthNo || '在港未靠泊' }}</template>
+            </div>
+          </template>
+        </el-table-column>
+        <el-table-column label="船长/电话" width="170">
+          <template #default="{ row }">
+            <div>{{ row.skipper }}</div>
+            <div class="muted" style="font-size:11px">{{ row.phone || '电话不可见' }}</div>
+            <el-tag v-if="row.contactHandoff" size="small" type="warning" effect="plain" style="margin-top:2px">
+              联系人待更新
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="departTime" label="出航时间" width="150" :formatter="fmtTime" />
+        <el-table-column prop="etaReturn" label="预计返回" width="150" :formatter="fmtTime" />
+        <el-table-column prop="route" label="目的地/航线" min-width="150" />
+        <el-table-column prop="crewCount" label="载员" width="70" />
+        <el-table-column prop="weather" label="海况天气预报" min-width="180" />
+        <el-table-column prop="statusName" label="状态" width="100">
+          <template #default="{ row }">
+            <el-tag size="small" :type="statusTag(row.status)">{{ row.statusName }}</el-tag>
+            <div v-if="row.status === 'SUSPENDED'" class="muted" style="font-size:10px;line-height:1.3">
+              {{ fmtTime(row, null, row.suspendedAt) }} 暂停
+            </div>
+          </template>
+        </el-table-column>
+        <el-table-column label="封航暂停原因" min-width="180">
+          <template #default="{ row }">
+            <span v-if="row.suspendedReason" style="color:#b3261e">{{ row.suspendedReason }}</span>
+            <span v-else-if="row.status === 'SUSPENDED'" class="muted">封航暂停放行</span>
+            <span v-else class="muted">—</span>
+            <div v-if="row.resumedAt" class="muted" style="font-size:11px">
+              已于 {{ fmtTime(row, null, row.resumedAt) }} 恢复可继续审批（未自动批准）
+            </div>
+          </template>
+        </el-table-column>
+        <el-table-column label="超期" width="110">
+          <template #default="{ row }">
+            <span v-if="row.overdueHours !== null && row.overdueHours !== undefined"
+                  style="color:#c62828; font-weight:700">超 {{ row.overdueHours }} 小时</span>
+            <span v-else class="muted">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="责任归属" width="104">
+          <template #default="{ row }">
+            <el-tag v-if="row.attributionStatus === 'PENDING'" size="small" type="danger">归属待判</el-tag>
+            <el-tag v-else-if="row.party" size="small" :type="partyTag(row.party)">{{ row.partyName }}</el-tag>
+            <el-tag v-else size="small" type="info" effect="plain">按持有期</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="230" fixed="right">
+          <template #default="{ row }">
+            <template v-if="isStaff">
+              <el-button v-if="row.status === 'PENDING'" type="primary" size="small" link
+                         :disabled="closureEffective"
+                         :title="closureEffective ? '封航生效中，不得批准；申报可保留为待审批' : ''"
+                         @click="act(row, 'approve')">审批</el-button>
+              <el-button v-if="row.status === 'APPROVED' && !row.vesselAtSea" type="warning" size="small" link
+                         @click="act(row, 'depart')">办理出港</el-button>
+              <el-button v-if="row.status === 'APPROVED' && row.vesselAtSea" type="success" size="small" link @click="act(row, 'return')">登记返航</el-button>
+              <el-button v-if="row.status === 'PENDING' || row.status === 'APPROVED'" type="danger" size="small" link
+                         @click="act(row, 'cancel')">取消</el-button>
+              <el-button v-if="row.status === 'SUSPENDED'" type="warning" size="small" link
+                         @click="$router.push('/closures')">去封航处置</el-button>
+              <span v-if="row.status === 'RETURNED' || row.status === 'CANCELED'" class="muted">已结单</span>
+            </template>
+            <el-tag v-else size="small" type="info" effect="plain">船主只读</el-tag>
+            <el-button v-if="row.contactHandoff && row.phone === null" type="primary" size="small" link
+                       @click="openContact(row)">补录联系人</el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+    </div>
+
+    <el-dialog v-model="createVisible" title="新建出航申报" width="560px">
+      <el-form :model="form" label-width="110px">
+        <el-form-item label="申报单号"><el-input v-model="form.planNo" /></el-form-item>
+        <el-form-item label="船只">
+          <el-select v-model="form.vesselId" filterable style="width:100%"
+                     :placeholder="isStaff ? '选择船只' : '只能选择您当前名下的船只'">
+            <el-option v-for="v in selectableVessels" :key="v.id"
+                       :label="`${v.name} · ${v.typeName}`" :value="v.id" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="船长/驾驶员"><el-input v-model="form.skipper" /></el-form-item>
+        <el-form-item label="联系电话"><el-input v-model="form.phone" placeholder="11 位手机号" /></el-form-item>
+        <el-form-item label="出航时间">
+          <el-date-picker v-model="form.departTime" type="datetime" value-format="YYYY-MM-DDTHH:mm:ss" style="width:100%" />
+        </el-form-item>
+        <el-form-item label="预计返回">
+          <el-date-picker v-model="form.etaReturn" type="datetime" value-format="YYYY-MM-DDTHH:mm:ss" style="width:100%" />
+        </el-form-item>
+        <el-form-item label="目的地/航线"><el-input v-model="form.route" /></el-form-item>
+        <el-form-item label="载员人数"><el-input-number v-model="form.crewCount" :min="1" :max="12" /></el-form-item>
+        <el-form-item label="海况天气"><el-input v-model="form.weather" placeholder="如：东南风 3 级，浪高 0.6m" /></el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="createVisible = false">取消</el-button>
+        <el-button type="primary" @click="submit">提交</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 交割承接后补录联系人 -->
+    <el-dialog v-model="contactVisible" title="补录本船联系人" width="420px">
+      <el-form label-width="100px">
+        <el-form-item label="船长/驾驶员"><el-input v-model="contactForm.skipper" :placeholder="contactRow.skipper || ''" /></el-form-item>
+        <el-form-item label="联系电话"><el-input v-model="contactForm.phone" placeholder="11 位手机号" /></el-form-item>
+        <div class="muted" style="font-size:12px">交割前的联系人是旧船主资料，承接后请补录您这边的联系方式。</div>
+      </el-form>
+      <template #footer>
+        <el-button @click="contactVisible = false">取消</el-button>
+        <el-button type="primary" @click="submitContact">保存</el-button>
+      </template>
+    </el-dialog>
+  </div>
+</template>
+
+<script setup>
+import { inject, onMounted, ref, computed } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { planApi, vesselApi, closureApi } from '../api'
+import { isStaff } from '../identity'
+
+const PLAN_STATUS = [
+  { value: 'PENDING', label: '待审批' },
+  { value: 'APPROVED', label: '已批准' },
+  { value: 'SUSPENDED', label: '暂停放行' },
+  { value: 'RETURNED', label: '已返航' },
+  { value: 'CANCELED', label: '已取消' }
+]
+
+const marina = inject('marina', null)
+const plans = ref([])
+const vessels = ref([])
+const closureEffective = ref(false)
+const statusFilter = ref('')
+const createVisible = ref(false)
+const form = ref({})
+const contactVisible = ref(false)
+const contactRow = ref({})
+const contactForm = ref({ skipper: '', phone: '' })
+
+function fmtTime(row, column, value) {
+  if (!value) return '—'
+  return String(value).replace('T', ' ').slice(0, 16)
+}
+
+function statusTag(status) {
+  return { PENDING: 'warning', APPROVED: 'primary', SUSPENDED: 'danger', RETURNED: 'success', CANCELED: 'info' }[status] || 'info'
+}
+
+function partyTag(party) {
+  return { OLD: 'primary', NEW: 'warning', SPLIT: 'success', PENDING: 'danger' }[party] || 'info'
+}
+
+/** 船主端只能为自己当前名下船只申报（heldByMe 由后端按持有区间回填） */
+const selectableVessels = computed(() =>
+  isStaff() ? vessels.value : vessels.value.filter((v) => v.heldByMe))
+
+/** 超期未返：整行标红 */
+function rowClass({ row }) {
+  return row.overdueHours !== null && row.overdueHours !== undefined ? 'row-overdue' : ''
+}
+
+async function load() {
+  const [list, vlist, active] = await Promise.all([
+    planApi.list(statusFilter.value ? { status: statusFilter.value } : {}),
+    vesselApi.list(),
+    closureApi.active()
+  ])
+  plans.value = list
+  vessels.value = vlist
+  closureEffective.value = !!(active && active.status === 'EFFECTIVE')
+}
+
+function openCreate() {
+  form.value = {
+    planNo: '', vesselId: null, skipper: '', phone: '',
+    departTime: '', etaReturn: '', route: '', crewCount: 4, weather: ''
+  }
+  planApi.nextNo().then((no) => { form.value.planNo = no })
+  createVisible.value = true
+}
+
+async function submit() {
+  await planApi.create(form.value)
+  createVisible.value = false
+  ElMessage.success('出航申报已提交')
+  await load()
+}
+
+async function act(row, action) {
+  const text = {
+    approve: '批准该申报？批准是放行许可：船仍在港，到出航时间自动办理出港（也可手动）。',
+    depart: '确认立即办理出港？仍占泊位的将先自动结算离泊，船只转为出海。',
+    return: '确认该船已返航？（封航返港请在「封航返港」处置台登记安全靠泊，以同步泊位）',
+    cancel: '取消该申报？'
+  }[action]
+  await ElMessageBox.confirm(text, '出航申报')
+  if (action === 'approve') await planApi.approve(row.id)
+  if (action === 'depart') await planApi.depart(row.id)
+  if (action === 'return') await planApi.markReturn(row.id)
+  if (action === 'cancel') await planApi.cancel(row.id)
+  ElMessage.success('已处理')
+  await load()
+  if (marina) {
+    await marina.refreshOverview()
+    await marina.reloadVessels()
+  }
+}
+
+onMounted(load)
+
+function openContact(row) {
+  contactRow.value = row
+  contactForm.value = { skipper: '', phone: '' }
+  contactVisible.value = true
+}
+
+async function submitContact() {
+  await planApi.updateContact(contactRow.value.id, {
+    skipper: contactForm.value.skipper, phone: contactForm.value.phone
+  })
+  contactVisible.value = false
+  ElMessage.success('联系人已更新')
+  await load()
+}
+</script>
