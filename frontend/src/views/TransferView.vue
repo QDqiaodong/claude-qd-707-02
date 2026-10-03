@@ -1,10 +1,10 @@
 <template>
   <div>
-    <el-alert v-if="!isStaff" type="info" :closable="false" show-icon style="margin-bottom:10px"
+    <el-alert v-if="!isStaffView" type="info" :closable="false" show-icon style="margin-bottom:10px"
               title="船主视角：可在此查看涉及您的完整过户交割链与逐项责任，但不能发起/更正交割。" />
     <el-tabs v-model="tab" class="panel">
       <!-- ================= 办理过户（仅员工） ================= -->
-      <el-tab-pane v-if="isStaff" name="wizard">
+      <el-tab-pane v-if="isStaffView" name="wizard">
         <template #label>
           <span>📝 办理过户</span>
         </template>
@@ -165,9 +165,9 @@
           <el-table-column label="原船主 → 新船主" min-width="200">
             <template #default="{ row }">
               {{ row.oldOwnerName }}
-              <span v-if="isStaff && row.oldOwnerPhone" class="muted" style="font-size:11px">（{{ row.oldOwnerPhone }}）</span>
+              <span v-if="isStaffView && row.oldOwnerPhone" class="muted" style="font-size:11px">（{{ row.oldOwnerPhone }}）</span>
               → <b>{{ row.newOwnerName }}</b>
-              <span v-if="isStaff && row.newOwnerPhone" class="muted" style="font-size:11px">（{{ row.newOwnerPhone }}）</span>
+              <span v-if="isStaffView && row.newOwnerPhone" class="muted" style="font-size:11px">（{{ row.newOwnerPhone }}）</span>
             </template>
           </el-table-column>
           <el-table-column prop="effectiveAt" label="生效时点" width="160" :formatter="fmtRow" />
@@ -193,7 +193,7 @@
       </el-tab-pane>
 
       <!-- ================= 归属待判台账 ================= -->
-      <el-tab-pane name="pending" v-if="isStaff">
+      <el-tab-pane name="pending" v-if="isStaffView">
         <template #label><span>⚖️ 归属待判 <el-badge v-if="pendingCountTop" :value="pendingCountTop" /></span></template>
         <div class="panel-head" style="padding:0 4px 12px">
           <h3 style="margin:0">归属待判台账</h3>
@@ -225,11 +225,11 @@
           <el-descriptions-item label="船只">{{ detail.vesselName }}（{{ detail.vesselRegNo }}）</el-descriptions-item>
           <el-descriptions-item label="原船主">
             {{ detail.oldOwnerName }}
-            <span v-if="isStaff && detail.oldOwnerPhone" class="muted">（{{ detail.oldOwnerPhone }}）</span>
+            <span v-if="isStaffView && detail.oldOwnerPhone" class="muted">（{{ detail.oldOwnerPhone }}）</span>
           </el-descriptions-item>
           <el-descriptions-item label="新船主">
             {{ detail.newOwnerName }}
-            <span v-if="isStaff && detail.newOwnerPhone" class="muted">（{{ detail.newOwnerPhone }}）</span>
+            <span v-if="isStaffView && detail.newOwnerPhone" class="muted">（{{ detail.newOwnerPhone }}）</span>
           </el-descriptions-item>
           <el-descriptions-item label="生效时点">{{ fmt(detail.effectiveAt) }}</el-descriptions-item>
           <el-descriptions-item label="交割说明">{{ detail.note || '—' }}</el-descriptions-item>
@@ -271,7 +271,7 @@
           <div v-if="!detail.corrections?.length" class="muted">暂无更正</div>
         </el-timeline>
 
-        <el-form v-if="isStaff" label-width="80px">
+        <el-form v-if="isStaffView" label-width="80px">
           <el-form-item label="追加更正">
             <el-input v-model="correctionText" type="textarea" :rows="2"
                       placeholder="原始交割记录不变，此处仅追加更正说明" />
@@ -339,6 +339,8 @@ import { identity, isStaff } from '../identity'
 
 const route = useRoute()
 const marina = inject('marina', null)
+/** 模板里的身份判定必须是响应式布尔（直接引用函数 isStaff 永远为真值） */
+const isStaffView = computed(() => isStaff())
 const tab = ref(isStaff() ? 'wizard' : 'chain')
 const vessels = ref([])
 const owners = ref([])

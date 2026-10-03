@@ -213,6 +213,12 @@ public class BerthService {
     /**
      * 泊位视图：{@code currentVessel*} 全部来自实体上的 {@code @JoinFormula} 派生关联
      * {@link Berth#getCurrentVessel()}，只读，不参与写入。
+     *
+     * <p>可见边界（在服务端裁剪，不能只靠前端隐藏）：
+     * 船主端（OWNER）只能看到自己【当前持有】船只的识别信息。泊位上若停的是别人的船，
+     * 泊位的「在泊」占用状态照常返回（别人据此知道该位不可用），但船只编号、名称、船型、
+     * 尺寸、吃水，以及在泊靠泊单号、靠泊时间、预计离泊等识别信息一律不返回。
+     * 码头工作人员（STAFF）不脱敏，可查看完整信息并办理业务。
      */
     public Views.BerthView toView(Berth berth, Map<Long, Berthing> openByBerth) {
         Vessel vessel = berth.getCurrentVessel();
@@ -221,15 +227,33 @@ public class BerthService {
             open = berthingRepository.findFirstByBerthIdAndStatusOrderByBerthTimeDesc(berth.getId(), "IN_PORT")
                     .orElse(null);
         }
-        // 可见边界：船主端看泊位时，其他船的船主姓名不回显（只保留在泊状态/船型），
-        // 自己当前名下船只正常显示船主。员工视角不脱敏。
-        String currentVesselOwner = vessel == null ? null : vessel.getOwnerName();
+        // 占用泊位的船是否为当前船主【当前持有】；不是则连同在泊单号/时间一起裁剪。
+        boolean canSeeVessel = true;
         if (vessel != null && !ActorContext.isStaff()) {
             Long me = ActorContext.ownerId();
             Long vesselOwner = vessel.getCurrentOwner() == null ? null : vessel.getCurrentOwner().getId();
-            if (me == null || !me.equals(vesselOwner)) {
-                currentVesselOwner = null;
-            }
+            canSeeVessel = me != null && me.equals(vesselOwner);
+        }
+        String currentVesselOwner = vessel == null ? null : vessel.getOwnerName();
+        if (!canSeeVessel) {
+            // 保留在泊占用状态，但不回显任何船只/在泊单号识别信息
+            return new Views.BerthView(
+                    berth.getId(),
+                    berth.getBerthNo(),
+                    berth.getZoneCode(),
+                    berth.getPierNo(),
+                    berth.getLengthM(),
+                    berth.getMaxDraftM(),
+                    berth.getAllowType(),
+                    MarinaDict.allowTypeNames(berth.getAllowType()),
+                    berth.getDailyRate(),
+                    berth.getUtility(),
+                    MarinaDict.utilityName(berth.getUtility()),
+                    berth.getStatus(),
+                    MarinaDict.berthStatusName(berth.getStatus()),
+                    null, null, null, null, null, null, null,
+                    null, null, null, null,
+                    berth.getUpdatedAt());
         }
         return new Views.BerthView(
                 berth.getId(),

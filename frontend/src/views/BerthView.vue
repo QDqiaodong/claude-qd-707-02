@@ -12,7 +12,7 @@
           <el-select v-model="filterStatus" clearable placeholder="全部状态" style="width: 140px">
             <el-option v-for="s in BERTH_STATUS" :key="s.value" :label="s.label" :value="s.value" />
           </el-select>
-          <el-button type="primary" v-if="isStaff" @click="openCreate">新建泊位</el-button>
+          <el-button type="primary" v-if="isStaffView" @click="openCreate">新建泊位</el-button>
           <el-button @click="loadAll">刷新</el-button>
         </div>
       </div>
@@ -64,7 +64,7 @@
             <text :x="cell.x + 98" :y="cell.y + 17" class="berth-len" text-anchor="end">{{ cell.berth.lengthM }}m</text>
 
             <!-- 在泊：画一艘小艇（船型不同，轮廓略作区别） -->
-            <g v-if="cell.berth.currentVesselName" :transform="`translate(${cell.x + 25}, ${cell.y + 41})`">
+            <g v-if="cell.berth.status === 'IN_PORT' && cell.berth.currentVesselName" :transform="`translate(${cell.x + 25}, ${cell.y + 41})`">
               <!-- 帆船：桅杆 + 主帆 + 前帆 -->
               <g v-if="cell.berth.currentVesselType === 'SAIL'">
                 <path d="M0 0 L56 0 L48 13 L8 13 Z" fill="#0277bd" />
@@ -99,14 +99,20 @@
                 <path d="M18 0 L18 -11 L31 -11 L35 0 Z" fill="#b3e5fc" stroke="#0277bd" stroke-width="1.2" />
               </g>
             </g>
+            <!-- 在泊但船只为他人持有：只画通用剪影，不显示任何船只识别信息 -->
+            <g v-else-if="cell.berth.status === 'IN_PORT'" :transform="`translate(${cell.x + 25}, ${cell.y + 41})`">
+              <path d="M0 0 L56 0 L48 13 L8 13 Z" fill="#90a4ae" />
+            </g>
             <!-- 空闲 / 预留 / 停用：中间给状态字 -->
             <text v-else :x="cell.x + 53" :y="cell.y + 52" class="berth-tip" text-anchor="middle">
               {{ cell.berth.statusName }}
             </text>
 
-            <!-- 右下角：当前船名（来自 @JoinFormula） -->
+            <!-- 右下角：自有在泊船显示船名；他人船只只显示「占用」；空泊位显示日租金 -->
             <text v-if="cell.berth.currentVesselName" :x="cell.x + 98" :y="cell.y + 70"
                   class="berth-vessel" text-anchor="end">{{ short(cell.berth.currentVesselName) }}</text>
+            <text v-else-if="cell.berth.status === 'IN_PORT'" :x="cell.x + 53" :y="cell.y + 70"
+                  class="berth-tip" text-anchor="middle">占用</text>
             <text v-else :x="cell.x + 98" :y="cell.y + 70" class="berth-len" text-anchor="end">
               ¥{{ cell.berth.dailyRate }}/天
             </text>
@@ -152,7 +158,7 @@
         </el-table-column>
         <el-table-column label="操作" width="110">
           <template #default="{ row }">
-            <el-button v-if="isStaff && row.status === 'IN_PORT'" type="warning" size="small" link
+            <el-button v-if="isStaffView && row.status === 'IN_PORT'" type="warning" size="small" link
                        @click="departBerth(row.berthId)">办理离泊</el-button>
             <span v-else class="muted">—</span>
           </template>
@@ -186,10 +192,14 @@
             靠泊单 {{ current.currentBerthingNo }} · 靠泊 {{ fmtTime(null, null, current.currentBerthTime) }}
           </div>
         </el-card>
+        <el-alert v-else-if="current.status === 'IN_PORT'" type="info" :closable="false" show-icon
+                  title="该泊位当前有船在泊"
+                  description="船只由其他船主持有，编号、名称、船型、尺寸、吃水、靠泊单号与时间费用等信息对您不可见。"
+                  style="margin-bottom:8px" />
         <el-empty v-else description="该泊位当前没有船在泊" :image-size="60" />
 
         <el-divider content-position="left">操作</el-divider>
-        <div class="inline-form" v-if="isStaff">
+        <div class="inline-form" v-if="isStaffView">
           <el-button type="primary" :disabled="current.status === 'IN_PORT' || current.status === 'DISABLED'"
                      @click="openOccupy">安排靠泊</el-button>
           <el-button type="warning" :disabled="current.status !== 'IN_PORT'" @click="departBerth(current.id)">办理离泊</el-button>
@@ -204,6 +214,9 @@
                   title="船主视角只读：靠泊/离泊/泊位设置请联系码头工作人员办理。" />
 
         <el-divider content-position="left">该泊位靠泊历史</el-divider>
+        <el-alert v-if="!isStaffView" type="info" :closable="false" show-icon
+                  title="仅显示您持有期间在该泊位的靠泊记录，其他船主的单号、时间与费用不予展示。"
+                  style="margin-bottom:8px" />
         <el-table :data="berthHistory" size="small" border max-height="220">
           <el-table-column prop="recordNo" label="单号" width="120" />
           <el-table-column prop="vesselName" label="船只" />
@@ -300,6 +313,9 @@ import { computed, inject, onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { berthApi, berthingApi, serviceApi, vesselApi } from '../api'
 import { isStaff } from '../identity'
+
+/** 模板里的身份判定必须是响应式布尔（直接引用函数 isStaff 永远为真值） */
+const isStaffView = computed(() => isStaff())
 
 const ZONES = ['A', 'B', 'C']
 const BERTH_STATUS = [

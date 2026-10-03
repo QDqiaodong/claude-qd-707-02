@@ -73,7 +73,7 @@
             <el-option label="已结" value="SETTLED" />
             <el-option label="挂账" value="ON_ACCOUNT" />
           </el-select>
-          <el-button v-if="isStaff" type="primary" @click="openCreate">登记服务</el-button>
+          <el-button v-if="isStaffView" type="primary" @click="openCreate">登记服务</el-button>
           <el-button @click="loadAll">刷新</el-button>
         </div>
       </div>
@@ -127,7 +127,7 @@
             <el-tag size="small" :type="settleTag(row.settleStatus)">{{ row.settleStatusName }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column v-if="isStaff" label="欠费说明 / 内部备注" min-width="180">
+        <el-table-column v-if="isStaffView" label="欠费说明 / 内部备注" min-width="180">
           <template #default="{ row }">
             <div v-if="row.debtNote" style="color:#c62828;font-size:11px">欠费：{{ row.debtNote }}</div>
             <div v-if="row.internalRemark" style="color:#6a1b9a;font-size:11px">备注：{{ row.internalRemark }}</div>
@@ -137,7 +137,7 @@
         </el-table-column>
         <el-table-column label="操作" width="160" fixed="right">
           <template #default="{ row }">
-            <template v-if="isStaff">
+            <template v-if="isStaffView">
               <el-button v-if="row.settleStatus !== 'SETTLED'" type="success" size="small" link
                          @click="settle(row, 'SETTLED')">结算</el-button>
               <el-button v-if="row.settleStatus !== 'ON_ACCOUNT'" type="warning" size="small" link
@@ -195,10 +195,10 @@
             <el-option label="挂账" value="ON_ACCOUNT" />
           </el-select>
         </el-form-item>
-        <el-form-item v-if="isStaff" label="欠费说明">
+        <el-form-item v-if="isStaffView" label="欠费说明">
           <el-input v-model="form.debtNote" placeholder="仅码头运营可见" />
         </el-form-item>
-        <el-form-item v-if="isStaff" label="内部备注">
+        <el-form-item v-if="isStaffView" label="内部备注">
           <el-input v-model="form.internalRemark" type="textarea" :rows="2" placeholder="仅码头运营可见" />
         </el-form-item>
         <div style="font-size:13px">金额：<b style="color:#c62828">¥{{ amount }}</b>（服务端现算，不接受前端传值）</div>
@@ -216,6 +216,9 @@ import { computed, inject, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { berthApi, serviceApi, vesselApi } from '../api'
 import { isStaff } from '../identity'
+
+/** 模板里的身份判定必须是响应式布尔（直接引用函数 isStaff 永远为真值） */
+const isStaffView = computed(() => isStaff())
 
 const SERVICE_TYPES = [
   { value: 'POWER', label: '接电', unit: '度', price: 12 },

@@ -11,7 +11,7 @@
           <el-select v-model="typeFilter" clearable placeholder="全部船型" style="width:130px" @change="load">
             <el-option v-for="t in VESSEL_TYPES" :key="t.value" :label="t.label" :value="t.value" />
           </el-select>
-          <el-button v-if="isStaff" type="primary" @click="openCreate">登记新船</el-button>
+          <el-button v-if="isStaffView" type="primary" @click="openCreate">登记新船</el-button>
           <el-button @click="load">刷新</el-button>
         </div>
       </div>
@@ -26,7 +26,7 @@
 
           <div class="muted" style="font-size:12px">
             船主 {{ v.ownerName }}
-            <template v-if="isStaff && v.ownerPhone"> · {{ v.ownerPhone }}</template>
+            <template v-if="isStaffView && v.ownerPhone"> · {{ v.ownerPhone }}</template>
             <el-tag v-if="v.heldByMe" size="small" type="success" style="margin-left:4px">我名下</el-tag>
             · {{ v.typeName }}
             · 当前泊位 <b :style="{ color: v.currentBerthNo ? '#0277bd' : '#90a4ae' }">{{ v.currentBerthNo || '未靠泊' }}</b>
@@ -59,7 +59,7 @@
 
           <div class="vessel-card-foot" style="gap:4px">
             <el-button size="small" @click="openHistory(v)">历史靠泊</el-button>
-            <template v-if="isStaff">
+            <template v-if="isStaffView">
               <el-button size="small" type="warning" @click="openInsurance(v)">续保</el-button>
               <el-button size="small" type="primary" plain @click="goTransfer(v)">办理过户</el-button>
               <el-select v-model="v.nextStatus" size="small" style="width:104px" placeholder="改状态"
@@ -133,11 +133,14 @@
 </template>
 
 <script setup>
-import { inject, onMounted, ref } from 'vue'
+import { computed, inject, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { vesselApi } from '../api'
 import { isStaff } from '../identity'
+
+/** 模板里的身份判定必须是响应式布尔（直接引用函数 isStaff 永远为真值） */
+const isStaffView = computed(() => isStaff())
 
 const nav = useRouter()
 

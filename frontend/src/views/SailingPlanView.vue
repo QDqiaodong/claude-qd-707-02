@@ -26,7 +26,7 @@
           </el-select>
           <el-button type="primary" @click="openCreate">新建申报</el-button>
           <el-button @click="load">刷新</el-button>
-          <el-tag v-if="!isStaff" size="small" type="info" effect="plain">
+          <el-tag v-if="!isStaffView" size="small" type="info" effect="plain">
             船主可申报；审批/出港/返航由码头办理
           </el-tag>
         </div>
@@ -92,7 +92,7 @@
         </el-table-column>
         <el-table-column label="操作" width="230" fixed="right">
           <template #default="{ row }">
-            <template v-if="isStaff">
+            <template v-if="isStaffView">
               <el-button v-if="row.status === 'PENDING'" type="primary" size="small" link
                          :disabled="closureEffective"
                          :title="closureEffective ? '封航生效中，不得批准；申报可保留为待审批' : ''"
@@ -162,6 +162,9 @@ import { inject, onMounted, ref, computed } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { planApi, vesselApi, closureApi } from '../api'
 import { isStaff } from '../identity'
+
+/** 模板里的身份判定必须是响应式布尔（直接引用函数 isStaff 永远为真值） */
+const isStaffView = computed(() => isStaff())
 
 const PLAN_STATUS = [
   { value: 'PENDING', label: '待审批' },
