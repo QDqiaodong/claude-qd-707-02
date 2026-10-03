@@ -63,8 +63,13 @@
             <text :x="cell.x + 8" :y="cell.y + 17" class="berth-no">{{ cell.berth.berthNo }}</text>
             <text :x="cell.x + 98" :y="cell.y + 17" class="berth-len" text-anchor="end">{{ cell.berth.lengthM }}m</text>
 
-            <!-- 在泊：画一艘小艇（船型不同，轮廓略作区别） -->
-            <g v-if="cell.berth.currentVesselName" :transform="`translate(${cell.x + 25}, ${cell.y + 41})`">
+            <!-- 在泊：他人船只在船主视角已被后端裁剪，画一条不具名的小艇占位 -->
+            <g v-if="cell.berth.status === 'IN_PORT' && !cell.berth.currentVesselName"
+               :transform="`translate(${cell.x + 25}, ${cell.y + 41})`">
+              <path d="M0 0 L56 0 L48 13 L8 13 Z" fill="#90a4ae" opacity="0.75" />
+            </g>
+            <!-- 在泊：自有船只画一艘小艇（船型不同，轮廓略作区别） -->
+            <g v-else-if="cell.berth.currentVesselName" :transform="`translate(${cell.x + 25}, ${cell.y + 41})`">
               <!-- 帆船：桅杆 + 主帆 + 前帆 -->
               <g v-if="cell.berth.currentVesselType === 'SAIL'">
                 <path d="M0 0 L56 0 L48 13 L8 13 Z" fill="#0277bd" />
@@ -104,9 +109,11 @@
               {{ cell.berth.statusName }}
             </text>
 
-            <!-- 右下角：当前船名（来自 @JoinFormula） -->
+            <!-- 右下角：自有船名（来自 @JoinFormula）；他人船只只显示「在泊占用」；空闲显示日租金 -->
             <text v-if="cell.berth.currentVesselName" :x="cell.x + 98" :y="cell.y + 70"
                   class="berth-vessel" text-anchor="end">{{ short(cell.berth.currentVesselName) }}</text>
+            <text v-else-if="cell.berth.status === 'IN_PORT'" :x="cell.x + 53" :y="cell.y + 70"
+                  class="berth-tip" text-anchor="middle">在泊占用</text>
             <text v-else :x="cell.x + 98" :y="cell.y + 70" class="berth-len" text-anchor="end">
               ¥{{ cell.berth.dailyRate }}/天
             </text>
@@ -172,7 +179,8 @@
         </div>
 
         <el-divider content-position="left">当前船只（@JoinFormula 派生）</el-divider>
-        <el-card v-if="current.currentVesselId" shadow="never" style="border-color:#b3e5fc">
+        <!-- 自有船只：完整信息 -->
+        <el-card v-if="current.currentVesselName" shadow="never" style="border-color:#b3e5fc">
           <div style="display:flex; align-items:center; gap:8px">
             <b style="font-size:15px">{{ current.currentVesselName }}</b>
             <el-tag size="small" type="primary">{{ current.currentVesselTypeName }}</el-tag>
@@ -185,6 +193,11 @@
           <div class="muted" style="margin-top:4px; font-size:12px">
             靠泊单 {{ current.currentBerthingNo }} · 靠泊 {{ fmtTime(null, null, current.currentBerthTime) }}
           </div>
+        </el-card>
+        <!-- 在泊但非自有船只：后端已裁剪识别字段，只提示占用状态 -->
+        <el-card v-else-if="current.status === 'IN_PORT'" shadow="never" style="border-color:#cfd8dc">
+          <span style="color:#607d8b">🔒</span>
+          <span class="muted" style="margin-left:6px">该泊位当前有船在泊，船只与靠泊信息属其他船主，不予展示。</span>
         </el-card>
         <el-empty v-else description="该泊位当前没有船在泊" :image-size="60" />
 
